@@ -1,0 +1,874 @@
+
+import configparser
+import pandas as pd
+import numpy as np
+
+from shapely.geometry import Point, Polygon
+
+import shapefile
+
+import warnings
+
+import sys
+
+import matplotlib
+""" plot2image requires this line when this is run from the command line """
+matplotlib.use('TKAgg')
+from matplotlib import pyplot as plt
+from mpl_toolkits.basemap import Basemap
+
+from osgeo import gdal, ogr, osr
+
+import os
+import pyproj
+
+import shapely
+
+
+""" FROM kpmb_plots """
+def plot2image(figresult):
+    """ 
+    Converts figresult contents (i.e., a plot, histogram, drawn shape) to a (RGB) numpy array
+    """
+    figresult.subplots_adjust(left=0.,right=1.0, top=1.0, bottom=0.0)
+    figresult.canvas.draw()
+    w,h= figresult.canvas.get_width_height()
+    result_im = np.frombuffer(figresult.canvas.tostring_rgb(), dtype=np.uint8).reshape(h,w,3)
+    figresult.clf()
+    plt.close()
+    return result_im
+
+
+
+""" FROM kpmb_osgeo """
+def to_UTM(shp, proj, inv=False):
+    geoInterface = shp.__geo_interface__
+    shpType = geoInterface['type']
+    coords = geoInterface['coordinates']
+    if shpType == 'Polygon':
+        newCoord = [[proj(*point, inverse=inv) for point in linring] for linring in coords]
+    elif shpType == 'MultiPolygon':
+        newCoord = [[[proj(*point, inverse=inv) for point in linring] for linring in poly] for poly in coords]
+    elif shpType == 'Point':
+        #print(coords)
+        newCoord = proj(*coords, inverse=inv)
+    return shapely.geometry.shape({'type': shpType, 'coordinates': tuple(newCoord)})
+
+def get_polygon_area(poly,latlon=True):
+    if latlon:
+        zone = int((np.floor((poly.centroid.x + 180) / 6 ) % 60)) + 1
+        proj = pyproj.Proj(proj='utm',zone=zone, ellips='WGS84', datum="WGS84")
+        return (to_UTM(poly,proj)).area /1e6 # in sq km (from sq m)
+    else:
+        return poly.area
+    
+def make_poly_valid(poly,latlon=True, resolution = 0.5):
+
+    area = get_polygon_area(poly, latlon=latlon)
+    #area_reso = 0.1 # 0.1 sq km is smallest lake
+    shoreline = np.sqrt(area)*4 # estimate
+    #print(area,area_reso,shoreline)
+    
+    # get lake down to 500 m resolution, roughly
+    simplify_reso = poly.length/(shoreline/resolution)
+    result = poly.simplify(simplify_reso)
+    if result.is_valid:
+        return result
+    else:
+        print('ERROR. STILL NOT VALID')
+        return poly
+
+
+def buffer_polygon(poly, npoly=10,
+        buffersize=1.0, areaX=None, convex_hull=True, show_results=False,
+        latlon=True):
+
+    """ npoly: maximum number of sides to the polygon
+    """
+    # print(buffersize)
+    if latlon:
+        multiplier = 1e3 # convert to metres from km
+    # determine actual zone from longitude
+        zone = int((np.floor((poly.centroid.x + 180) / 6 ) % 60)) + 1
+        proj = pyproj.Proj(proj='utm',zone=zone, ellips='WGS84', datum="WGS84")
+    # converted to metres from lat,lon
+        init_shape_utm = to_UTM(poly, proj)
+    else:
+        multiplier = 1.0
+        init_shape_utm = poly
+        
+    buffer_m = buffersize*multiplier 
+
+    # Lake's initial area
+    init_area = init_shape_utm.area # in square metres
+    
+    if areaX is not None:
+        target_area = init_area * areaX
+    else:
+        target_area = init_area
+    
+    # Apply convex_hull 
+    if convex_hull:
+        # add convex hull
+        reshaped_utm = init_shape_utm.convex_hull
+    
+    # simplify polygon in some other way
+    elif (len(init_shape_utm.exterior.xy[0])-1) >npoly:
+        tol0 = ( init_shape_utm.length / npoly ) / 100.
+        #tol0 = np.sqrt(init_shape_utm.area)/100.
+        poly2 = init_shape_utm
+        ii=1
+        while ((len(poly2.exterior.xy[0])-1) > npoly) & (ii<100):
+            tol = tol0*ii
+            poly2 = init_shape_utm.simplify(tol)
+            #if show_results:
+            #    print ('n-Polygon: {:}'.format(len(poly2.exterior.xy[0])-1))
+            #    print ('Simplify tolerance: {:.2f}'.format(tol))
+            #    print ('Area: {:.1f}'.format(poly2.area/1e6))
+            ii=ii+1
+        reshaped_utm = init_shape_utm.simplify(tol)
+    # may not need to simplified if less than npoly-sided polygon
+    else:
+        reshaped_utm = init_shape_utm
+        
+    reshaped_area = reshaped_utm.area
+    
+    if reshaped_area < target_area:
+        # new multiplication factor
+        areaX_ = target_area / reshaped_area
+        # guess at buffer assuming perfect circle
+        #buffer_m = np.sqrt ( reshaped_area / np.pi ) * (np.sqrt(areaX_) - 1) # metres
+        #print('circle',buffer_m)
+        # guess at buffer assuming square
+        #buffer_m = np.sqrt(reshaped_area / 4. ) * (np.sqrt(areaX_) - 1)
+        #print('square',buffer_m)
+
+        # guess based on perimeter
+        perimeter = reshaped_utm.length
+        buffer_m = (1./4. * np.sqrt((perimeter/2.)**2 + 4*reshaped_area*(areaX_ -1 )) - 
+                    1./4. * (perimeter/2.)
+                    )
+        
+        if show_results:
+            print('Buffer:', buffer_m, 'Multiplier (area):', areaX_)
+    else:
+    # i.e., there is a minimum buffer to apply even if reshaped_area is larger than target
+        buffer_m = buffer_m
+    
+    #print(buffer_m, buffersize, multiplier)
+    if buffer_m < (buffersize*multiplier):
+        buffer_m = buffersize*multiplier
+        
+    # apply buffer to polygon
+    #return reshaped_utm, buffer_m
+    #print('Trying buffer')
+    buffer_shape_utm = reshaped_utm.buffer(buffer_m)
+    #print('Succeeded buffer')
+    if show_results:
+        if convex_hull:
+            print('Found convex hull of polygon')
+        print('Buffer of {:.1f} km added around polygon.'.format(buffer_m/multiplier))
+        print('\tInitial polygon area: {:.1f} km2'.format(init_area/(multiplier**2)))
+        print('\tReshaped/convex hull: {:.1f} km2'.format(reshaped_utm.area/(multiplier**2)))
+        print('\tTarget area         : {:.1f} km2'.format(target_area/(multiplier**2)))
+        print('\tFinal polygon area  : {:.1f} km2'.format(buffer_shape_utm.area/(multiplier**2)))
+        print('\t\t (FACTOR {:.1f})'.format(buffer_shape_utm.area/init_area))
+
+    if latlon:
+        result = to_UTM(buffer_shape_utm, proj, inv=True)
+    else:
+        result = buffer_shape_utm
+    return result, buffer_m/multiplier # buffer in km
+
+
+def poly_to_ogr(poly):
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    # longitude, latitude 
+    for (i,j) in zip(poly.exterior.xy[0], poly.exterior.xy[1]):
+    # add (longitude, latitude) points to ring
+        ring.AddPoint(i,j)
+    result = ogr.Geometry(ogr.wkbPolygon)
+    result.AddGeometry(ring)
+    #polytxt = 'POLYGON (({}))'.format(', '.join(['{} {}'.format(i,j) for (i, j) in zip(poly.exterior.xy[1], poly.exterior.xy[0])]))
+    #print(polytxt)
+    #result = ogr.CreateGeometryFromWkt(polytxt)
+    return result
+
+def transform_poly(poly, wkt_to = "+proj=sinu +R=6371007.181 +nadgrids=@null +wktext", 
+                       # EPSG:4326 is same as World Geodetic System 1984 (WGS 84)
+                       wkt_from = '+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs'):
+                      # epsg_from=4326):
+    """ Transform polygon shape to osgeo geometry """
+    result = poly_to_ogr(poly)
+    #print(result.GetPoints())
+    # Target
+    modis = osr.SpatialReference()
+    err = modis.ImportFromProj4( wkt_to)
+    #print(err)
+    # Source
+    wgs84 = osr.SpatialReference()
+    err = wgs84.ImportFromProj4( wkt_from) 
+    #print(err)
+    #wgs84.ImportFromEPSG( epsg_from)
+    
+    tx = osr.CoordinateTransformation( wgs84, modis )
+    #print(tx)
+    #print(result.ExportToWkt())
+    
+    result.Transform(tx)
+    modis=None
+    wgs84=None
+    tx = None
+    return result
+
+def bounds_raster(dataset):
+    """
+    Creates a rectangular polygon shape object from the input raster dataset,
+       defining the boundary of the input dataset.
+    """
+    #raster = gdal.Open(filename)
+    ulx,xres,xskew, uly, yskew, yres = dataset.GetGeoTransform()
+    lrx = ulx + (dataset.RasterXSize * xres)
+    lry = uly + (dataset.RasterYSize * yres)
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    ring.AddPoint(lrx,lry)
+    ring.AddPoint(ulx,lry)
+    ring.AddPoint(ulx,uly)
+    ring.AddPoint(lrx,uly)
+    ring.AddPoint(lrx,lry)
+    #return ring
+    polygon_env = ogr.Geometry(ogr.wkbPolygon)
+    polygon_env.AddGeometry(ring)
+    return polygon_env #box(lrx,lry,ulx,uly)
+
+
+""" FROM kpmb_modis """
+# Get list of all relevant MODIS files
+def get_modis_files(basedir='/Users/blagrave/Projects/Lakes/data/Land Use Data World 2015/'):
+    all_files = [basedir+c for c in os.listdir(basedir) if ('MCD12Q1' in c) & ('hdf' in c)]
+    return all_files
+    
+
+def convert_gdal_to_xy(gx,gy, conversion_dict={}):
+    x = (gx - conversion_dict['CRVAL1']) / conversion_dict['CDELT1'] + conversion_dict['CRPIX1']
+    y = (gy - conversion_dict['CRVAL2']) / conversion_dict['CDELT2'] + conversion_dict['CRPIX2']
+    return x,y
+
+
+def find_modis_pixels(poly_shape,basedir='/Users/blagrave/Projects/Lakes/data/Land Use Data World 2015/',label=None,show_results = False, deltameridian=1,deltaparallel=1,poly_shape2 = None):
+    if show_results:
+        fig,axes = plt.subplots(2,1,figsize=(88./25.4,88./25.4))
+        #fig.subplots_adjust(left=0.,right=1.0,top=1.0,bottom=0,hspace=0.)
+        #axes[1].ticklabel_format(axis='both',style='sci',scilimits = (0,0))
+        axes[1].get_xaxis().set_visible(False)
+        axes[1].get_yaxis().set_visible(False)
+
+        xlimits, ylimits = [],[]
+        
+        x,y = poly_shape.exterior.xy
+        x = np.array(x)
+        y = np.array(y)
+        print('lat: {:.4f} lon: {:.4f}'.format(y.mean(),x.mean()))
+        m = Basemap(projection='tmerc',llcrnrlon=min(x),llcrnrlat=min(y),urcrnrlon=max(x),urcrnrlat=max(y),
+                    lon_0=x.mean(),lat_0=y.mean(),resolution='i',ax=axes[0])
+        parallels_ls, parallels_lw = [1,0],0.3
+        print(np.floor(min(x)/deltameridian)*deltameridian)
+        print(max(x)+2*deltameridian, deltameridian)
+        meridians = np.arange(np.floor(min(x)/deltameridian)*deltameridian,max(x)+2*deltameridian,deltameridian)
+        parallels = np.arange(np.floor(min(y)/deltaparallel)*deltaparallel,max(y)+2*deltaparallel,deltaparallel)
+        charsize=8
+        m.drawmeridians(meridians,color='0.7', dashes=parallels_ls, labels=[False,False,True,False],
+                        linewidth=parallels_lw,size=charsize)
+        m.drawparallels(parallels,color='0.7', dashes=parallels_ls, labels=[True,False,False,False],
+                        linewidth=parallels_lw,size=charsize)
+        x,y = m(*poly_shape.exterior.xy)
+        m.drawmapboundary(fill_color='lightskyblue')
+        m.fillcontinents(color='0.95',lake_color='lightskyblue')
+        #m.drawcoastlines()
+        axes[0].plot(x,y)
+        if poly_shape2 is not None:
+            x2,y2 = m(*poly_shape2.exterior.xy)
+            axes[0].fill(x2,y2,color='C0',alpha=0.5)
+        if label is not None:
+            filename = './Figures/HydroLAKE_{}.pdf'.format(label)
+            axes[0].text(0.5,0.5,label, ha='center',va='center',transform=axes[0].transAxes, fontsize=10)
+        else:
+            filename = './foo.pdf'
+    
+    poly_shape_osgeo = transform_poly(poly_shape)
+    #print(poly_shape)
+    #print(poly_shape_osgeo)
+    all_files = get_modis_files(basedir=basedir)
+    result = []
+    # run through all MODIS files
+    for f in all_files:
+        #print(f)
+        dataset = gdal.Open(f, gdal.GA_ReadOnly)
+        dataset2 = gdal.Open(dataset.GetSubDatasets()[0][0])
+        poly_modis_bounds = bounds_raster(dataset2)
+
+        #poly_modis_bounds = bounds_raster(gdal.Open(dataset.GetSubDatasets()[0][0]))
+    # see if MODIS file intersects (reprojected) lake
+        #print(poly_modis_bounds)
+        region_overlap = poly_modis_bounds.Intersection(poly_shape_osgeo)
+        
+        if region_overlap.GetGeometryCount() > 0:
+            #print(f)
+            xx = np.array([poly_modis_bounds.GetGeometryRef(0).GetX(i) for i in range(poly_modis_bounds.GetGeometryRef(0).GetPointCount())])
+            yy = np.array([poly_modis_bounds.GetGeometryRef(0).GetY(i) for i in range(poly_modis_bounds.GetGeometryRef(0).GetPointCount())])
+            # numpy array
+            data = dataset2.ReadAsArray()
+            conversion_dict = {'CRPIX1':0, 'CRVAL1':np.min(xx), 'CDELT1':(np.max(xx)-np.min(xx))/data.shape[1],
+                'CRPIX2':0, 'CRVAL2':np.max(yy), 'CDELT2':(np.min(yy)-np.max(yy))/data.shape[0]}
+            #print(conversion_dict)
+            xx2 = [region_overlap.GetGeometryRef(0).GetX(i) for i in range(region_overlap.GetGeometryRef(0).GetPointCount())]
+            yy2 = [region_overlap.GetGeometryRef(0).GetY(i) for i in range(region_overlap.GetGeometryRef(0).GetPointCount())]
+            
+            # extract only pixels within mask
+            mask = convert_gdal_to_xy(xx2,yy2, conversion_dict = conversion_dict)
+            dpi = 256
+            plt.ioff()
+            fig2,ax2 = plt.subplots(figsize=(data.shape[1]/dpi,data.shape[0]/dpi), dpi=dpi)
+            # plot overlapping geometry
+            ax2.fill(xx2,yy2,facecolor='k',edgecolor='none')
+            ax2.spines['right'].set_visible(False)
+            ax2.spines['left'].set_visible(False)
+            ax2.spines['bottom'].set_visible(False)
+            ax2.spines['top'].set_visible(False)
+            ax2.axis('off')
+            ax2.set_xlim(xx.min(),xx.max())
+            ax2.set_ylim(yy.min(),yy.max())
+            mask = plot2image(fig2)
+            #print(xx2,yy2)
+            #print(mask.shape)
+            #fig2.savefig('./savedFig.pdf')
+            plt.close(fig2)
+            plt.ion()
+            mask = mask[:,:,0].copy()
+            #pickle.dump(mask,open( 'foo.pickle', 'wb' ))
+            cutoff = 255
+            #cutoff = 128
+            mask[mask< cutoff] = 1
+            mask[mask>=cutoff] = 0
+            
+            #print(mask.sum())
+            resultfoo = mask*data
+            resultfoo = resultfoo.astype(float)
+            indzero = resultfoo==0
+            resultfoo[indzero] = np.nan
+
+            if show_results:
+                # try to zoom in on portion of xx2,yy2 only
+                #print('Resultfoo shape', resultfoo.shape)
+                #print('not indzero',~indzero)
+                #plt.imshow(~indzero)
+                
+                # returns columns and rows
+                resy, resx = np.argwhere(~indzero).T
+                #print(resx, resy)
+                #plt.scatter(resx,resy,marker='.',color='C0')
+                #plt.show()
+                
+                #print('xmin, xmax,ymin,ymax', xx.min(), xx.max(), yy.min(), yy.max())
+                xx2 = np.array(xx2)
+                yy2 = np.array(yy2)
+                #print('xmin2, xmax2,ymin2,ymax2', xx2.min(), xx2.max(), yy2.min(), yy2.max())
+                #print('minx2, maxx2, miny2, maxy2', resx.min(), resx.max(), resy.min(), resy.max())
+                
+                #xlimits.extend([xx.min(), xx.max()])
+                #ylimits.extend([yy.min(), yy.max()])
+                
+                deltaresy = np.max([(resy.max() - resy.min()) // 2 , 10])
+                deltaresx = np.max([(resx.max() - resx.min()) // 2 , 10])
+                #print('DELTA X, DELTA Y', deltaresx, deltaresy)
+                
+                # adjust to smaller size
+                ypixmax = np.min([resy.max()+deltaresy, data.shape[0]-1])
+                ypixmin = np.max([resy.min()-deltaresy,0])
+                xpixmin = np.max([resx.min()-deltaresx,0])
+                xpixmax = np.min([resx.max()+deltaresx, data.shape[1]-1])
+                #print(xpixmin, xpixmax, ypixmin,ypixmax)
+                #print('Delta X min', resx.min() - xpixmin)
+                #print('Delta X max', xpixmax - resx.max())
+                #print('Delta Y min', resy.min() - ypixmin)
+                #print('Delta Y max', ypixmax - resy.max())
+                #print('Resolution: ', (xx2.max()-xx2.min()) / (resx.max()-resx.min()),
+                #                      (yy2.max()-yy2.min()) / (resy.max()-resy.min()) )
+                deltaxx2_upper = 1.0*(xpixmax - resx.max()) * (xx2.max()-xx2.min()) / (resx.max()-resx.min())
+                deltaxx2_lower = 1.0*(resx.min() - xpixmin) * (xx2.max()-xx2.min()) / (resx.max()-resx.min())
+                deltayy2_lower = 1.0*(ypixmax - resy.max()) * (yy2.max()-yy2.min()) / (resy.max()-resy.min())
+                deltayy2_upper= 1.0*(resy.min() - ypixmin) * (yy2.max()-yy2.min()) / (resy.max()-resy.min())
+
+                #print(deltaxx2_lower, deltaxx2_upper, deltayy2_lower, deltayy2_upper)
+                xlimits.extend([xx2.min()-deltaxx2_lower, xx2.max()+deltaxx2_upper])
+                ylimits.extend([yy2.min()-deltayy2_lower, yy2.max()+deltayy2_upper])
+                #print ('X extent: ', [xx2.min()-deltaxx2_lower, xx2.max()+deltaxx2_upper])
+                #print ('Y extent: ', [yy2.min()-deltayy2_lower, yy2.max()+deltayy2_upper])
+                
+                axes[1].imshow(data[ypixmin:ypixmax,
+                                    xpixmin:xpixmax],
+                            extent=[xx2.min()-deltaxx2_lower,xx2.max()+deltaxx2_upper,
+                                    yy2.min()-deltayy2_lower,yy2.max()+deltayy2_upper],
+                            vmin=1,vmax=17,alpha=0.6)
+                
+
+                #axes[1].imshow(data,extent=[xx.min(),xx.max(),yy.min(),yy.max()],vmin=1,vmax=17,alpha=0.3)
+                axes[1].plot(xx,yy,color='k')
+                #print(xx,yy)
+                # highlight because otherwise small lakes won't show up at all
+                #axes[1].fill(xx2,yy2,color='k',alpha=0.3)
+                #axes[1].set_title('MODIS DATA')
+                #print(resultfoo)
+                #return (resultfoo)
+                cax=axes[1].imshow(resultfoo[ypixmin:ypixmax,
+                                             xpixmin:xpixmax],
+                        extent=[xx2.min()-deltaxx2_lower,xx2.max()+deltaxx2_upper,
+                                yy2.min()-deltayy2_lower,yy2.max()+deltayy2_upper],
+                        vmin=1,vmax=17,alpha=1.0)
+     
+                #cax=axes[1].imshow(resultfoo,extent=[xx.min(),xx.max(),yy.min(),yy.max()],vmin=1,vmax=17,alpha=1.0)
+            resultfoo = resultfoo[~indzero]
+            
+            result = np.append(result,resultfoo)
+            resultfoo = None
+            mask = None
+            data = None
+            xx,yy,xx2,yy2=None,None,None,None
+            
+        dataset = None
+        dataset2 = None
+        poly_modis_bounds = None
+        region_overlap = None
+        
+    poly_shape_osgeo = None
+        
+    index,counts = np.unique(result,return_counts=True)
+    result = {int(i):c for i,c in zip(index,counts)}
+    if show_results:
+        #spacing = 2.
+        #for (key,value) in result.items():
+        #    axes[1].text(-(spacing-1)/2. + key*1./17.*spacing,-0.5, u'{}\n${}$'.format(key,value),
+        #                 ha = 'right',transform=axes[1].transAxes,fontsize=8)
+        axes[1].set_xlim(min(xlimits),max(xlimits))
+        axes[1].set_ylim(min(ylimits),max(ylimits))
+        #axes[2].set_visible(False)
+        cbar = fig.colorbar(cax,ax=axes[1],orientation='horizontal',fraction=0.046, pad=0.1)
+        cbar.ax.tick_params(labelsize=8)
+        display(pd.DataFrame(result,index=['# of pixels']))
+        fig.savefig(filename)
+        plt.show()
+        plt.close(fig)
+        
+    return result
+
+
+""" FROM kpmb_population """
+def find_population_pixels(poly_shape,pop_array, show_results=False,label=None,deltaparallel=1, deltameridian=1,
+                          poly_shape2=None,  
+                          coords = {'xsize0':None, 
+              'ysize0':None,
+              'x_min0':None, 
+              'xpixel_size0':None, 
+              'xro0':None, 
+              'y_max0':None, 
+              'yro0':None, 
+              'ypixel_size0':None}):
+    """
+    - read population TIF file
+    - select all 30 arcesecond pixels within lakeshape and sum
+      i.e., rasterize lakeshape polygon and use it as a mask
+    """
+              
+    xsize0,ysize0,x_min0,xpixel_size0,xro0,y_max0,yro0,ypixel_size0 = coords.values()
+    
+    if show_results:
+        fig,axes = plt.subplots(2,1,figsize=(88./25.4,88./25.4))
+        #fig.subplots_adjust(left=0.,right=1.0,top=1.0,bottom=0,hspace=0.)
+        #axes[1].ticklabel_format(axis='both',style='sci',scilimits = (0,0))
+        axes[1].get_xaxis().set_visible(False)
+        axes[1].get_yaxis().set_visible(False)
+
+        xlimits, ylimits = [],[]
+        
+        x,y = poly_shape.exterior.xy
+        x = np.array(x)
+        y = np.array(y)
+        print(x.mean(),y.mean())
+        m = Basemap(projection='tmerc',llcrnrlon=min(x),llcrnrlat=min(y),urcrnrlon=max(x),urcrnrlat=max(y),
+                    lon_0=x.mean(),lat_0=y.mean(),resolution='i',ax=axes[0])
+        parallels_ls, parallels_lw = [1,0],0.3
+        meridians = np.arange(np.floor(min(x)/deltameridian)*deltameridian,max(x)+2*deltameridian,deltameridian)
+        parallels = np.arange(np.floor(min(y)/deltaparallel)*deltaparallel,max(y)+2*deltaparallel,deltaparallel)
+     
+        #meridians = np.arange(-180,180,deltameridian)
+        #parallels = np.arange(0,91,deltaparallel)
+        charsize=8
+        m.drawmeridians(meridians,color='0.7', dashes=parallels_ls, labels=[False,False,True,False],
+                        linewidth=parallels_lw,size=charsize)
+        m.drawparallels(parallels,color='0.7', dashes=parallels_ls, labels=[True,False,False,False],
+                        linewidth=parallels_lw,size=charsize)
+        x,y = m(*poly_shape.exterior.xy)
+        m.drawmapboundary(fill_color='lightskyblue')
+        m.fillcontinents(color='0.95',lake_color='lightskyblue')
+        #m.drawcoastlines()
+        axes[0].plot(x,y)
+        if poly_shape2 is not None:
+            x2,y2 = m(*poly_shape2.exterior.xy)
+            axes[0].fill(x2,y2,color='C0',alpha=0.5)
+        if label is not None:
+            filename = './Figures/popHydroLAKE_{}.pdf'.format(label)
+            axes[0].text(0.5,0.5,label, ha='center',va='center',transform=axes[0].transAxes, fontsize=10)
+        else:
+            filename = './popfoo.pdf'
+    
+    # CREATE MASK based on input shape, poly_shape
+    outDriver = ogr.GetDriverByName("MEMORY")
+    outShapefile = "memData"
+
+    outDataSource = outDriver.CreateDataSource(outShapefile)
+    #outDataSource.SetGeoTransform((x_min, xpixel_size0, xro0, 
+    #                           y_max, yro0, ypixel_size0))
+    dest_srs = osr.SpatialReference()
+    dest_srs.ImportFromProj4('+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs')
+
+    source_layer = outDataSource.CreateLayer("lake_extent", dest_srs,
+                                             geom_type=ogr.wkbPolygon)
+                                             
+    
+    featureDefn = source_layer.GetLayerDefn()
+    feature = ogr.Feature(featureDefn)
+    # convert shapefile to OGR polygon
+    poly_shape_osgeo = poly_to_ogr(poly_shape)
+    #return poly_shape_osgeo
+    # add polygon to layer feature
+    feature.SetGeometry(poly_shape_osgeo)
+    source_layer.CreateFeature(feature)
+
+    # get extent of polygon as longitude, latitude
+    x_min, x_max, y_min, y_max = source_layer.GetExtent()
+    #print('original extent of shape:', x_min,x_max,y_min,y_max)
+    
+    
+    # final size of grid to allow for all pixels to be included
+    # adding extra one pixel buffer to account for x_min and x_min0 not being aligned (see below)
+    x_res = int(np.ceil((x_max - x_min) / np.abs(xpixel_size0)))+1 + 1
+    y_res = int(np.ceil((y_max - y_min) / np.abs(ypixel_size0)))+1 + 1
+    #print(x_res,y_res)
+    ## Round lakeshape extent to population grid coordinates
+    ## Want population grid value,xmin0, to be less than x_min so none of shape is cutoff
+    ## want population grid value, ymax0, to be greater than y_max
+    pixdiff = (x_min - (x_min0+xpixel_size0*np.arange(xsize0)))
+    # calculate upper left corner offset for shape grid
+    x_offset =  (pixdiff > 0) & (pixdiff <= np.abs(xpixel_size0))
+    piydiff = ((y_max0 + ypixel_size0*np.arange(ysize0)) - y_max)
+    y_offset =  (piydiff > 0) & (piydiff <= np.abs(ypixel_size0))
+    #print(x_offset.sum(),y_offset.sum())
+    #print(piydiff[y_offset])
+    x_offset,y_offset = np.argwhere(x_offset)[0][0], np.argwhere(y_offset)[0][0]
+    x_min,y_max = x_min0+xpixel_size0*x_offset,y_max0+ypixel_size0*y_offset
+    x_max = x_min + (x_res-1)*xpixel_size0
+    y_min = y_max + (y_res-1)*ypixel_size0
+
+    # Output file to write to and tehn read in
+    raster_fn = 'test.tif'
+    NoData_value = -9999
+    #print('final projected grid extent:', x_min,x_max,y_min,y_max)
+    #print('Number of pixels:',x_res,y_res)
+    target_ds = gdal.GetDriverByName('GTiff').Create(raster_fn, 
+                                                     x_res, y_res, 
+                                                     1, gdal.GDT_Byte)
+    #print(x_min,xpixel_size0,xro0,
+    #      y_max,yro0,ypixel_size0)
+    target_ds.SetGeoTransform((x_min, xpixel_size0, xro0, 
+                               y_max, yro0, ypixel_size0))
+
+    band = target_ds.GetRasterBand(1)
+    band.SetNoDataValue(NoData_value)    
+
+    #source_layer.SetGeoTransform((x_min, xpixel_size0, xro0, 
+    #                           y_max, yro0, ypixel_size0))
+    
+# Rasterize
+    err = gdal.RasterizeLayer(target_ds,
+                              [1], source_layer, None, None,[1],['ALL_TOUCHED=TRUE'])
+    if err != 0:
+        print(err)
+        #gdaltest.post_reason( 'got non-zero result code from RasterizeLayer' )
+        return 'fail'
+    # close file in order to open it (raster_fn, 'test.tif', is target_ds)
+    target_ds = None
+    
+    # Open and look at raster_fn, test.tif
+    dataset2 = gdal.Open(raster_fn, gdal.GA_ReadOnly)
+    rasterband = dataset2.GetRasterBand(1)
+    lakeraster = rasterband.ReadAsArray()
+    #rasterband.GetExtent()
+    #lakeraster[lakeraster==0] = -99999
+    #print(x_offset,x_res,y_offset,y_res)
+    popraster = pop_array[y_offset:y_offset+y_res, x_offset:x_offset+x_res]
+    popraster[popraster < 0] = np.nan
+    result = lakeraster*popraster
+    result[lakeraster==0] = np.nan
+    #return result
+    if show_results:
+        #print(popraster.shape)
+        #print(result.shape)
+        axes[1].imshow(popraster, extent=[x_min-0*np.abs(xpixel_size0)/2.,
+                                          x_max+2*np.abs(xpixel_size0)/2.,
+                                          y_min-2*np.abs(ypixel_size0)/2.,
+                                          y_max+0*np.abs(ypixel_size0)/2.], 
+                       alpha=0.3,
+                  vmin=0, vmax = np.nanpercentile(result[result!=0],95))
+        xx,yy,_ = zip(*poly_shape_osgeo.GetGeometryRef(0).GetPoints())
+        #print(xx,yy)
+        axes[1].plot(xx,yy,color='k')
+        cax=axes[1].imshow(result, extent=[x_min-0*np.abs(xpixel_size0)/2.,
+                                          x_max+2*np.abs(xpixel_size0)/2.,
+                                          y_min-2*np.abs(ypixel_size0)/2.,
+                                          y_max+0*np.abs(ypixel_size0)/2.], alpha=1.0,
+                  vmin=0, vmax = np.nanpercentile(result[result!=0],95))
+        cbar = fig.colorbar(cax,ax=axes[1],orientation='horizontal',fraction=0.046, pad=0.1)
+        cbar.ax.tick_params(labelsize=8)
+        #display(pd.DataFrame(result,index=['# of pixels']))
+        fig.savefig(filename)
+        plt.show()
+        plt.close(fig)
+    #if show_results:
+    #    print(np.nanpercentile(result,95))
+    #    plt.imshow(result, vmin=0,vmax = np.nanpercentile(result[result!=0],95))
+    #    plt.show()
+    #return result
+    #target_ds = None
+    outDataSource = None
+    dataset2 = None
+    
+    return np.nansum(result)
+
+""" FROM hydrolakes """
+def get_hylak_data(hylakid, sf=None):
+
+    """
+    Returns HydroLAKES lake information for ID hylakid
+    Requires specification of HydroLAKES shapefile, sf
+    """
+    return pd.DataFrame(sf.record(int(hylakid)-1),index = [f[0] for f in sf.fields[1:]]).transpose()
+    #return hydrodf.loc[hydrodf.Hylak_id==hylakid, :]
+
+
+
+""" NEW functions for use here only """
+def get_latlonarea_columns(df):
+    
+    #display(dfchlasub.head())    
+    latcolumn = [c for c in df.columns if 'lat' in str(c).lower()]
+    loncolumn = [c for c in df.columns if 'lon' in str(c).lower()]
+    areacolumn = [c for c in df.columns if 'area' in str(c).lower()]
+    
+    if (len(latcolumn)!=1) | (len(loncolumn)!=1):
+        print('Need to specify Latitude and Longitude column names')
+        print(df.columns)
+        latcolumn = input('Latitude column:')
+        loncolumn = input('Longitude column:')
+    else:
+        latcolumn = latcolumn[0]
+        loncolumn = loncolumn[0]
+
+    if len(areacolumn)!=1:
+        print('Need to specify area column name')
+        areacolumn = input('Area column:')
+    else:
+        areacolumn = areacolumn[0]
+
+    return latcolumn,loncolumn,areacolumn
+
+def determine_targetarea(initialarea, model=None):
+    # Global relationship between Watershed+Lake Area and Lake Area is calculated from
+    #   a linear regression of log(WshdArea+LakeArea) on log(LakeArea) for all HydroLAKES
+    """
+    xx = np.log(dfchla['HydroLAKES.Lake_area'])
+    yy = np.log(dfchla['HydroLAKES.Wshd_area'] + dfchla['HydroLAKES.Lake_area'])
+    ind = ~xx.isnull()  & ~yy.isnull()
+    model = sm.OLS(yy[ind].values,sm.add_constant(xx[ind]).values).fit()
+    """
+    # MODEL RESULTS
+    if model is None:
+        result = initialarea
+    elif np.isnan(initialarea):
+        result = np.nan
+    else:
+        const,x1 = float(model['const']), float(model['x1'])
+        if model['logmodel']:
+            result = np.exp ( const + x1 * np.log(initialarea) )
+        else:
+            result = const + x1 * initialarea
+    return result
+
+def create_polygon(target_area, starting_poly, initial_area=None, buffer_min = 1.0):
+
+    # areaX is the ratio of target to initial area.
+    # It only needs to be defined for the case where starting_poly is not a singular point
+    areaX = None
+    
+    # If target area is unknown, simply use the minimum buffer
+    if np.isnan(target_area):
+        buffer = buffer_min
+    # If starting_poly is simply a Point, then determine radius of circle with 'area'
+    elif isinstance(starting_poly,Point):
+        buffer = np.max([np.sqrt(target_area / np.pi), buffer_min])
+    elif initial_area is None:
+        buffer = buffer_min
+    # Ratio of target and initial areas for sending into buffer_polygon.
+    #   This is only needed if the starting_poly is not a Point
+    else:
+        areaX = target_area / initial_area
+    #print(starting_poly, buffer, areaX)
+
+    poly_shape, buffer_m = buffer_polygon(starting_poly, buffersize=buffer, areaX = areaX,
+            latlon=True)
+            
+    return poly_shape, buffer_m
+
+def read_population_file(filename):
+    #filename = '/Users/blagrave/Projects/Lakes/data/population/gpw-v4-population-count-rev11_2015_30_sec_tif/gpw_v4_population_count_rev11_2015_30_sec.tif'
+    dataset = gdal.Open(filename, gdal.GA_ReadOnly)
+    pop_array = dataset.ReadAsArray()
+    xsize0, ysize0 = dataset.RasterXSize, dataset.RasterYSize
+    (x_min0, xpixel_size0, xro0, y_max0, yro0, ypixel_size0) = dataset.GetGeoTransform()
+
+    coords_pop = {'xsize0':xsize0, 
+              'ysize0':ysize0,
+              'x_min0':x_min0, 
+              'xpixel_size0':xpixel_size0, 
+              'xro0':xro0, 
+              'y_max0':y_max0, 
+              'yro0':yro0, 
+              'ypixel_size0':ypixel_size0}
+    dataset = None
+    return pop_array, coords_pop
+
+def get_hydrolakes_shape(hylakid, sf=None):
+
+    if sf is None:
+        print('Need to include shapefile, sf=sf')
+        return
+    shape = sf.shape(hylakid-1)
+    parts = shape.parts
+
+    if len(parts) > 1:
+        lakeshape = Polygon(shape.points[0:parts[1]])
+    else:
+        lakeshape = Polygon(shape.points)
+
+    if not lakeshape.is_valid:
+        lakeshape = make_poly_valid(lakeshape)
+    return lakeshape      
+
+
+def show_progress(pctdone):
+    lendone = int(np.round(pctdone*60))
+    sys.stdout.write('\r['+'*'*lendone+'-'*(60-lendone)+'] {:.1f}% COMPLETE'.format(pctdone*100))
+    sys.stdout.flush()
+    
+if __name__ == "__main__":  
+
+    warnings.filterwarnings('ignore')
+
+    config = configparser.ConfigParser()
+    config.read('./config_landuse.ini')
+
+    filename = config.get('INPUT','filename')
+    filename_pop = config.get('INPUT','pop_file')
+    modis_directory = config.get('INPUT','modis_directory')
+    fileout = config.get('OUTPUT','fileout')
+
+    # This is the minimum buffer radius to be added around polygon
+    buffer_min = float(config.get('PARAMS','buffer_min'))
+
+    model = {ii: config.get('PARAMS',ii) for ii in ['const','x1','logmodel']}                
+
+    # load file with (lat,lon) and area if it exists
+    try:
+        df = pd.read_csv(filename)
+    except:
+        print('Could not load file: {}'.format(filename))
+    
+    pop_array, coords_pop = read_population_file(filename_pop)
+
+    try:
+        latcolumn,loncolumn,areacolumn = config.get('COLUMNS','lat'), config.get('COLUMNS','lon'),config.get('COLUMNS','area')
+    except:
+        latcolumn,loncolumn,areacolumn = get_latlonarea_columns(df)
+
+    hydrocolumn = [c for c in df.columns if 'Hylak_id' in c]
+    
+    # If HydroLAKES column exists, read in complete HydroLAKES shapefile, as 'sf'.
+    if len(hydrocolumn) > 0:
+        hydrolakes_file = config.get('INPUT','hydrolakes_file')
+        sf = shapefile.Reader(hydrolakes_file,encoding='latin1')
+
+    # Cycle through all (lat,lon) coordinates
+    dfresult = df.loc[:,[latcolumn,loncolumn,areacolumn]].copy()
+    for i in range(1,18):
+        dfresult.loc[:, i] = np.nan
+    totcnt = len( df.drop_duplicates([latcolumn,loncolumn]))
+    cnt = 0
+    for i,row in df.drop_duplicates([latcolumn,loncolumn]).iterrows():
+        lat,lon,initial_area = row[latcolumn],row[loncolumn],row[areacolumn]
+    
+        target_area = determine_targetarea(initial_area, model=model)
+        hylak_id = np.nan
+        # Check if there is a HydroLAKES match for this lake (if there is even a HydroLAKES ID column)
+        if len(hydrocolumn)>0:
+            if np.isnan(row[hydrocolumn[0]]):
+                hylak_id = np.nan
+            else:
+                hylak_id = int(row[hydrocolumn[0]])
+                #print('HydroLAKES lake found')
+                watershed_area = get_hylak_data(hylak_id, sf = sf).Wshd_area.values[0]
+                initial_area = get_hylak_data(hylak_id, sf=sf).Lake_area.values[0]
+                target_area = (watershed_area+initial_area)
+    
+        # Create polygon with target_area
+        if not np.isnan(hylak_id):
+            starting_poly = get_hydrolakes_shape(hylak_id, sf = sf)
+
+        else:
+            starting_poly = Point(lon,lat)
+        # returns polygon shape in latlon coordinates
+        #  buffer_m is in metres
+        poly_shape, buffer_m = create_polygon(target_area, starting_poly, buffer_min = buffer_min)
+    
+        # if show_results=True, might want to change these
+        deltaparallel, deltameridian= 0.5,0.5
+        # using this polygon, extract population data
+        # This uses OSGEO ogr routines
+        resultpop = find_population_pixels(poly_shape,pop_array,show_results=False,deltaparallel=deltaparallel, 
+                                    deltameridian=deltameridian,
+                                    label=i, poly_shape2=None, coords = coords_pop)
+        # ...and MODIS land use data
+        # Mask gets created and then uses routine to turn plot into array (plot2image)
+        resultmodis = find_modis_pixels(poly_shape,basedir=modis_directory,show_results=False,
+                                    deltaparallel=deltaparallel, 
+                                    deltameridian=deltameridian,
+                                    label=i, poly_shape2=None)
+        #resultmodis = {1:20,4:56}
+        # relabel columns by land use type (1 to 17)
+        dfoo = pd.DataFrame(resultmodis, index=[i]).reindex(range(1,18),axis=1,fill_value=0)
+    
+        #dfresult = dfresult.merge(dfoo,left_index=True,right_index=True, how='left',validate='one_to_one')
+        #dfresult.loc[i,range(1,18)] = dfoo
+        #display(dfoo)
+        dfresult.loc[i, range(1,18)] = dfoo.values
+        dfresult.loc[i,'Population'] = resultpop
+        dfresult.loc[i,'Target_area'] = target_area
+        dfresult.loc[i,'Buffer'] = buffer_m
+        dfresult.loc[i,'Final_area'] = get_polygon_area(poly_shape)
+        cnt = cnt + 1
+        pct_done = float(cnt) / totcnt
+        show_progress(pct_done)
+
+    dfresult.to_csv(fileout,index=False)
+        
+        
+        
+        
